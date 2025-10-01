@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Great Lakes Shipping Animation - Smooth</title>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <style>
+      html, body { height: 100%; margin: 0; }
+      #map { position: absolute; inset: 0; }
+      #datetime {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        background: rgba(0,0,0,0.8);
+        color: white;
+        padding: 12px 16px;
+        border-radius: 8px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 16px;
+        font-weight: 500;
+        z-index: 2;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="datetime">Loading...</div>
+    <div id="map"></div>
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <script>
+      /* global maplibregl */
+
+      const map = new maplibregl.Map({
+        container: 'map',
+        style: 'https://api.maptiler.com/maps/4f3844e3-915c-4b23-8123-421d75edf135/style.json?key=IuJ0D0R9S0Cjl4krhvr1',
+        center: [-84.5, 44.8],
+        zoom: 6
+      });
+
+      let trajectories = [];
+      let currentTime = 0;
+      let timeRange = { min: 0, max: 0 };
+      let playing = true; // Start playing automatically
+      let raf = null;
+      let shipPositions = new Map(); // MMSI -> current position
+
+      const datetime = document.getElementById('datetime');
+
+      // Load trajectory data
+      async function loadTrajectories() {
+        try {
+          const response = await fetch('ship_trajectories_slim.geojson');
+          // const response = await fetch('ship_trajectories.geojson');
+          const data = await response.json();
+          trajectories = data.features;
+          
+          // Calculate time range from per-trajectory t0/t1 fields (slim format)
+          let minTime = Infinity, maxTime = -Infinity;
+          for (const traj of trajectories) {
+            const startTime = Number(traj.properties.t0);
+            const endTime = Number(traj.properties.t1);
+            if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) continue;
+            if (startTime < minTime) minTime = startTime;
+            if (endTime > maxTime) maxTime = endTime;
+          }
+          timeRange = { min: minTime, max: maxTime };
+          
+          console.log(`Loaded ${trajectories.length} trajectories`);
+          console.log(`Time range: ${new Date(minTime * 1000)} to ${new Date(maxTime * 1000)}`);
+          
+          await setupMap();
+        } catch (error) {
+          console.error('Failed to load trajectories:', error);
+          datetime.textContent = 'Failed to load data';
+        }
+      }
+
+      async function setupMap() {
+        // Add static route layer showing all ship positions
+        map.addSource('routes', {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] }
+        });
+
+        // Route dots (static, smaller, semi-transparent)
+        map.addLayer({
+          id: 'routes', type: 'circle', source: 'routes',
+          paint: {
+            'circle-radius': 1.5,
+            'circle-color': 'rgba(100, 100, 100, 0.4)',
+            'circle-stroke-width': 0
+          }
+        });
+
+        // Add ship positions as GeoJSON source
+        map.addSource('ships', {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] }
+        });
+
+        // Ship circles (reliable render)
+        map.addLayer({
+          id: 'ships', type: 'circle', source: 'ships',
+          paint: {
+            'circle-radius': [
+              'interpolate', ['linear'], ['coalesce', ['get', 'length'], 20],
+              10, 4, 100, 7, 300, 12
+            ],
+            'circle-color': '#1971c2',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#fff'
+          }
+        });
+
+        // Create ship icon using ImageBitmap to satisfy MapLibre's image expectations
+        const canvas = document.createElement('canvas');
+        canvas.width = 32;
+        canvas.height = 32;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, 32, 32);
+        ctx.fillStyle = '#333';
+        ctx.beginPath();
+        ctx.moveTo(16, 4);
+        ctx.lineTo(28, 16);
+        ctx.lineTo(16, 28);
+        ctx.lineTo(4, 16);
+        ctx.closePath();
+        ctx.fill();
+        const bitmap = await createImageBitmap(canvas);
+        if (!map.hasImage('ship-icon')) {
+          map.addImage('ship-icon', bitmap);
+        }
+        
+        // Populate the routes layer with all ship positions (disabled for performance)
+        // populateRoutesLayer();
+        
+        updateAnimation();
+        startAnimation();
+      }
+
+      // Function to populate the static routes layer
+      function populateRoutesLayer() {
+        const routeFeatures = [];
+        const pointMap = new Map(); // For deduplication
+        let pointCount = 0;
+        const maxPoints = 50000; // Limit to prevent browser crash
+        
+        for (const traj of trajectories) {
+          const coords = traj.geometry.coordinates;
+          if (!coords || coords.length < 2) continue;
+          
+          // Sample every 10th coordinate to reduce density further
+          for (let i = 0; i < coords.length; i += 10) {
+            if (pointCount >= maxPoints) break;
+            
+            const coord = coords[i];
+            const lon = coord[0], lat = coord[1];
+            
+            // Simple Great Lakes region check for route points
+            if (isInGreatLakesRegion(lon, lat)) {
+              // Round to reduce duplicates (more aggressive rounding)
+              const key = `${Math.round(lon * 100) / 100}_${Math.round(lat * 100) / 100}`;
+              if (!pointMap.has(key)) {
+                pointMap.set(key, true);
+                routeFeatures.push({
+                  type: 'Feature',
+                  geometry: { type: 'Point', coordinates: [lon, lat] },
+                  properties: { mmsi: traj.properties.mmsi }
+                });
+                pointCount++;
+              }
+            }
+          }
+          if (pointCount >= maxPoints) break;
+        }
+        
+        // Update the routes layer
+        map.getSource('routes').setData({
+          type: 'FeatureCollection',
+          features: routeFeatures
+        });
+        
+        console.log(`Added ${routeFeatures.length} route points (optimized, max ${maxPoints})`);
+      }
+
+      // Calculate distance between two points in miles
+      function calculateDistance(lon1, lat1, lon2, lat2) {
+        const R = 3959; // Earth's radius in miles
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                  Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                  Math.sin(dLon/2) * Math.sin(dLon/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
+      }
+
+      // Simple Great Lakes bounding box check
+      function isInGreatLakesRegion(lon, lat) {
+        return (lat >= 41.0 && lat <= 49.5 && lon >= -93.0 && lon <= -73.5);
+      }
+
+      function updateAnimation() {
+        const time = timeRange.min + (timeRange.max - timeRange.min) * (currentTime / 100);
+        const features = [];
+        for (const traj of trajectories) {
+          const times = traj.properties.t; // per-vertex unix times (slim format)
+          const coords = traj.geometry.coordinates;
+          if (!times || times.length<2) continue;
+          
+          // Pre-filter: Skip trajectories with too many unrealistic segments
+          let unrealisticSegments = 0;
+          let totalSegments = 0;
+          for (let j = 0; j < times.length - 1; j++) {
+            const segmentTime = times[j+1] - times[j];
+            if (segmentTime > 0) {
+              totalSegments++;
+              const segmentDist = Math.sqrt(
+                Math.pow(coords[j+1][0] - coords[j][0], 2) + 
+                Math.pow(coords[j+1][1] - coords[j][1], 2)
+              );
+              const segmentSpeed = segmentDist / segmentTime * 111000 / 0.514444;
+              if (segmentTime > 1440*60 || segmentSpeed > 100) { // 24 hours, 100 knots
+                unrealisticSegments++;
+              }
+            }
+          }
+          
+          // Skip trajectories where more than 95% of segments are unrealistic
+          if (totalSegments > 0 && unrealisticSegments / totalSegments > 0.95) {
+            continue;
+          }
+          
+          // Enhanced filtering to eliminate unrealistic movements
+          // Only render vessels within their active window (with small pre/post grace)
+          const grace = 15 * 60; // 15 minutes - more permissive
+          const start = times[0], end = times[times.length-1];
+          if (time < start - grace || time > end + grace) continue;
+          
+          // find segment [i,i+1] containing time
+          let i=0;
+          while (i<times.length-1 && times[i+1] < time) i++;
+          i = Math.min(i, times.length-2);
+          const t0 = times[i], t1 = times[i+1];
+          const p0 = coords[i], p1 = coords[i+1];
+          
+          // Calculate distance and speed between points
+          const distance = Math.sqrt(
+            Math.pow(p1[0] - p0[0], 2) + Math.pow(p1[1] - p0[1], 2)
+          );
+          const timeGap = t1 - t0;
+          
+          // Filter out unrealistic movements
+          if (timeGap <= 0) continue; // Invalid time gap
+          
+          // Calculate speed (degrees per second - rough conversion)
+          const speedDegPerSec = distance / timeGap;
+          const speedKnots = speedDegPerSec * 111000 / 0.514444; // Very rough conversion
+          
+          // Check distance between actual data points first - hide immediately if too far
+          const distanceMiles = calculateDistance(p0[0], p0[1], p1[0], p1[1]);
+          const maxDistanceMiles = 20; // Maximum 20 miles for interpolation
+          
+          if (distanceMiles > maxDistanceMiles) {
+            continue; // Skip if distance between data points is too large
+          }
+          
+          // Check time gap between points - hide if more than 6 hours
+          const timeGapHours = timeGap / 3600; // Convert seconds to hours
+          const maxTimeGapHours = 6; // Maximum 6 hours between points
+          
+          if (timeGapHours > maxTimeGapHours) {
+            continue; // Skip if time gap is too large
+          }
+          
+          // Filter out unrealistic speeds (>150 knots) or very large time gaps (>48 hours)
+          const maxGapMinutes = 2880; // 48 hours - extremely lenient for shipping data
+          const maxGapSeconds = maxGapMinutes * 60;
+          const maxSpeedKnots = 150; // Very high limit to catch only impossible speeds
+          
+          if (timeGap > maxGapSeconds || speedKnots > maxSpeedKnots) {
+            // Only show at exact data points, not during interpolation
+            if (Math.abs(time - t0) < 30) {
+              // Within 30 seconds of start point - show at start
+              alpha = 0;
+            } else if (Math.abs(time - t1) < 30) {
+              // Within 30 seconds of end point - show at end  
+              alpha = 1;
+            } else {
+              // In the middle of unrealistic gap - hide ship
+              continue;
+            }
+          } else {
+            // Normal interpolation for realistic movements
+            if (t1 !== t0) {
+              alpha = Math.max(0, Math.min(1, (time - t0)/(t1 - t0)));
+            }
+          }
+          const lon = p0[0] + (p1[0]-p0[0])*alpha;
+          const lat = p0[1] + (p1[1]-p0[1])*alpha;
+          
+          // Also check if in Great Lakes region as safety net
+          if (!isInGreatLakesRegion(lon, lat)) {
+            continue; // Skip if outside Great Lakes region
+          }
+          
+          features.push({
+            type:'Feature', geometry:{ type:'Point', coordinates:[lon,lat] },
+            properties:{
+              mmsi: traj.properties.mmsi,
+              vessel_name: traj.properties.vessel_name,
+              vessel_type: traj.properties.vessel_type,
+              length: traj.properties.length,
+              width: traj.properties.width
+            }
+          });
+        }
+        map.getSource('ships').setData({ type:'FeatureCollection', features });
+        const date = new Date(time * 1000);
+        datetime.textContent = date.toLocaleString();
+      }
+
+      function tick() {
+        if (!playing) return;
+        
+        const step = 0.02; // Fixed speed for display
+        currentTime = (currentTime + step) % 100;
+        
+        updateAnimation();
+        raf = requestAnimationFrame(tick);
+      }
+
+      // Start animation automatically
+      function startAnimation() {
+        if (playing) {
+          raf = requestAnimationFrame(tick);
+        }
+      }
+
+      // Popup on click
+      map.on('click', 'ships', (e) => {
+        const f = e.features[0];
+        const p = f.properties;
+        const html = `
+          <div><strong>${p.vessel_name || 'Unknown'}</strong></div>
+          <div>MMSI: ${p.mmsi}</div>
+          <div>Heading: ${Math.round(p.heading)}°</div>
+          <div>Length: ${p.length || '—'} m</div>`;
+        new maplibregl.Popup().setLngLat(e.lngLat).setHTML(html).addTo(map);
+      });
+
+      map.on('mouseenter', 'ships', () => map.getCanvas().style.cursor = 'pointer');
+      map.on('mouseleave', 'ships', () => map.getCanvas().style.cursor = '');
+
+      // Load data when map is ready
+      map.on('load', () => {
+        // Add shipping routes source to the custom style
+        map.addSource('shipping_routes', {
+          type: 'vector',
+          tiles: [
+            'https://api.maptiler.com/tiles/01999fdc-1fe0-73e4-aae7-48dc8e9ba145/{z}/{x}/{y}.pbf?key=IuJ0D0R9S0Cjl4krhvr1'
+          ],
+          minzoom: 0,
+          maxzoom: 14
+        });
+        
+        // Try to add shipping routes layer with common layer names
+        const possibleLayerNames = ['shipping_routes_final', 'shipping_routes', 'routes', 'shipping', 'lines', 'default'];
+        
+        function tryAddLayer(layerName) {
+          try {
+            map.addLayer({
+              id: 'shipping-routes',
+              type: 'circle',
+              source: 'shipping_routes',
+              'source-layer': layerName,
+              paint: {
+                'circle-color': 'rgba(100, 200, 255, 0.8)',
+                'circle-radius': 2,
+                'circle-opacity': 0.8
+              }
+            });
+            console.log(`Successfully added shipping routes with source-layer: ${layerName}`);
+            return true;
+          } catch (error) {
+            console.log(`Failed to add layer with source-layer: ${layerName}`, error.message);
+            return false;
+          }
+        }
+        
+        // Try each possible layer name
+        for (const layerName of possibleLayerNames) {
+          if (tryAddLayer(layerName)) {
+            break;
+          }
+        }
+        
+        // Debug: Check available source layers
+        console.log('Map loaded, checking vector tile source...');
+        map.on('sourcedata', (e) => {
+          if (e.sourceId === 'shipping_routes' && e.isSourceLoaded) {
+            console.log('Shipping routes source loaded');
+            console.log('Source data:', e.source);
+            // Try to get the source to inspect available layers
+            const source = map.getSource('shipping_routes');
+            console.log('Source object:', source);
+          }
+        });
+        loadTrajectories();
+      });
+    </script>
+  </body>
+</html>
